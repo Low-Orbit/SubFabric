@@ -1078,7 +1078,22 @@ export function initProjects(ctx) {
     // 注: 下面各模型的下载状态提示都是就地手写的(见 pyState / state / nemoState 等),
     // 没有走统一模板 —— 各自要拼的按钮和文案差别太大, 抽象反而更绕。
     // Python 环境(Parakeet 需要; whisper.cpp 不需要): 预检状态 + 一键安装
-    const py = d.pythonProbe || null;
+    // pythonProbe 现在按引擎分键（{sherpa, openvino}）—— 直接读 .ok 会得到 undefined，
+    // 于是把好环境误判成"不可用"（实测踩过）。这里挑**当前所选模型**对应的那一项；
+    // 旧版扁平形状（{ok,msg}）仍然兼容。
+    const py = (() => {
+      const pp = d.pythonProbe;
+      if (!pp) return null;
+      if (typeof pp.ok === 'boolean') return pp;                 // 旧形状
+      const sel = (d.models || []).find(m => m.id === d.selectedModel)
+        || (d.models || []).find(m => m.usable) || null;
+      const key = sel && sel.engine === 'openvino' ? 'openvino' : 'sherpa';
+      const one = pp[key];
+      if (one) return one;
+      return d.pythonProbeFlat || null;
+    })();
+    // 探测里带上用的哪个解释器，界面上能看到（多份安装时这点很重要）
+    const pyExe = d.python || '';
     const pySt = dlOf('pyenv');
     let pyState;
     if (pySt.running) {
@@ -1098,6 +1113,12 @@ export function initProjects(ctx) {
       <div class="sm-head"><span class="sm-name">Python 环境</span></div>
       <div class="sm-desc">Parakeet 识别要 Python 和 sherpa-onnx，还得有 N 卡（CUDA）。说话人分离只要基础 Python，没有 N 卡也能用；whisper.cpp 不需要 Python。点「安装」会装好 Python 和依赖，有 N 卡时一并换成 CUDA 版。不写注册表，删掉 asr\\runtime-python 目录就算卸载</div>
       ${pyState}
+      <div class="sm-desc" style="margin-top:6px">当前解释器：<code>${esc(pyExe || '(未定)')}</code>
+        <button type="button" class="btn btn-mini sm-pyset">指定其他 Python…</button>
+        <button type="button" class="btn btn-mini sm-pyreset">用回默认</button>
+      </div>
+      <div class="sm-desc">如果另一份安装里已经装好了 torch + NeMo，用上面「指定其他 Python…」指过去即可，不必重下几 GB</div>
+      <div class="sm-pymsg" style="font-size:12px;margin-top:4px"></div>
     </div>`;
     // 各任务 key: model:<id> / runtime / diarize
     rows += (d.models || []).map((m) => {
@@ -1209,6 +1230,45 @@ export function initProjects(ctx) {
         })).json();
         if (r.started) pollModelDownload();
       } catch {}
+      renderAsrModels();
+    }));
+    // 指定 / 恢复 Python 解释器（运行时装在别处时用，例如复用另一份安装里的 torch+NeMo）
+    box.querySelectorAll('.sm-pyset').forEach(b => b.addEventListener('click', async () => {
+      const msg = box.querySelector('.sm-pymsg');
+      b.disabled = true;
+      const old = b.textContent;
+      b.textContent = '选择中…';
+      try {
+        let pick = null;
+        try {
+          pick = await (await fetch('/api/pick', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'python' }),
+          })).json();
+        } catch { pick = null; }
+        if (!pick || !pick.path) {
+          if (msg) msg.textContent = '没选到文件，已取消';
+          return;
+        }
+        const r = await (await fetch('/api/asr/set-python', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exe: pick.path }),
+        })).json();
+        if (msg) msg.textContent = r && r.ok ? ('已切换解释器：' + r.python + '，正在重新检测…') : ('切换失败：' + ((r && r.error) || '未知错误'));
+      } finally {
+        b.disabled = false;
+        b.textContent = old;
+        renderAsrModels();
+      }
+    }));
+    box.querySelectorAll('.sm-pyreset').forEach(b => b.addEventListener('click', async () => {
+      b.disabled = true;
+      try {
+        await fetch('/api/asr/set-python', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ exe: '' }),
+        });
+      } catch {}
+      b.disabled = false;
       renderAsrModels();
     }));
     box.querySelectorAll('.sm-del').forEach(b => b.addEventListener('click', () => {
@@ -1593,8 +1653,14 @@ export function initProjects(ctx) {
     genSetState('np', (genTr && genTr.ready) ? '已配置' : '翻译未配置');
     // Python 环境预检失败 → 提前提醒(不拦按钮: whisper.cpp 引擎不需要 Python, 由服务端预检按引擎分流)
     const hint = $('#np-hint');
-    if (hint && asrStatus.pythonProbe && !asrStatus.pythonProbe.ok) {
-      hint.textContent = '⚠ Python 环境不可用：' + asrStatus.pythonProbe.msg + '。Parakeet 模型需要 Python（修复方法见创建后的日志）；whisper.cpp 和「必剪 ASR」云端识别都不需要 Python';
+    const probeForUi = (() => {
+      const pp = asrStatus.pythonProbe;
+      if (!pp) return null;
+      if (typeof pp.ok === 'boolean') return pp;                 // 旧扁平形状
+      return asrStatus.pythonProbeFlat || null;                  // 服务端按当前引擎挑好的
+    })();
+    if (hint && probeForUi && !probeForUi.ok) {
+      hint.textContent = '⚠ Python 环境不可用：' + probeForUi.msg + '。Parakeet 模型需要 Python（修复方法见创建后的日志）；whisper.cpp 和「必剪 ASR」云端识别都不需要 Python';
       hint.style.color = '#ff9a5c';
     }
     npMaybeEnable();
