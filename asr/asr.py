@@ -31,6 +31,12 @@ import wave
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# 置信度算法与 NPU 引擎共用同一个模块（asr/confidence.py，有单元测试）。
+# 注意：本引擎拿不到 token 概率（sherpa 的 result 只有 text/tokens/timestamps），
+# 所以只有「音频质量」与「稳定性」两个信号 —— 融合时按可用信号加权。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import confidence as C  # noqa: E402
+
 SAMPLE_RATE = 16000
 FEATURE_DIM = 80
 
@@ -293,6 +299,42 @@ def load_recognizer(model_dir, threads, hotwords=None, hotwords_score=3.0, provi
     return rec
 
 
+def _decode_chunks(rec, samples, sr, chunks, noise=0.0, seed=12345, quiet=False):
+    """逐块推理 -> [[{id, frame, text}, ...], ...]（每块一个 token 列表）。
+
+    为什么单独抽出来：稳定性那一项要给音频加噪声**重跑**，两次必须走**完全相同**的
+    分块与解码路径，才能逐位置比对 token。所以这里只做"块 → token 序列"，
+    词的重建留给 recognize_words —— 免得两份逻辑漂移。
+
+    frame 用真实秒数（与 chunk 起点对齐后）—— 上游 confidence.py 按序号区间归词，
+    不依赖时间，这里留真实时间只是为了排查方便。
+    """
+    out = []
+    for ci, (cs, ce) in enumerate(chunks):
+        seg = samples[int(cs * sr):int(ce * sr)]
+        if len(seg) == 0:
+            out.append([])
+            continue
+        if noise > 0:
+            import numpy as np
+            rng = np.random.default_rng(seed + ci)
+            seg = seg + rng.normal(0.0, noise, len(seg)).astype(seg.dtype)
+        stream = rec.create_stream()
+        stream.accept_waveform(sr, seg)
+        rec.decode_stream(stream)
+        r = stream.result
+        toks = []
+        for tid, (tok, ts) in enumerate(zip(r.tokens, getattr(r, "timestamps", []))):
+            if not tok.strip():
+                continue
+            toks.append({"id": tid, "frame": float(ts) + cs, "text": tok})
+        out.append(toks)
+        if not quiet:
+            progress(30 + int((ci + 1) / max(1, len(chunks)) * 55), "asr",
+                     "识别中 … 第 %d/%d 块" % (ci + 1, len(chunks)))
+    return out
+
+
 def recognize_words(rec, samples, sr, chunks):
     """逐块推理 -> 词列表 [{word, start, anchor}]。
 
@@ -300,22 +342,17 @@ def recognize_words(rec, samples, sr, chunks):
     标点 token 的时间戳常落在停顿里, 所以额外记录最后一个「含字母数字的 token」的
     时间作为 anchor, 后续用它推算真实结束时间。
     """
-    words = []
-    for ci, (cs, ce) in enumerate(chunks):
-        seg = samples[int(cs * sr):int(ce * sr)]
-        if len(seg) == 0:
-            continue
-        stream = rec.create_stream()
-        stream.accept_waveform(sr, seg)
-        rec.decode_stream(stream)
-        r = stream.result
+    per_chunk = _decode_chunks(rec, samples, sr, chunks)
 
+    words = []
+    for toks in per_chunk:
         cur = None
-        for tok, ts in zip(r.tokens, getattr(r, "timestamps", [])):
+        for tk in toks:
+            tok = tk["text"]
             piece = tok.strip()
             if not piece:
                 continue
-            t_abs = float(ts) + cs
+            t_abs = tk["frame"]
             if cur is not None and tok.startswith(" "):
                 words.append(cur)
                 cur = None
@@ -328,14 +365,32 @@ def recognize_words(rec, samples, sr, chunks):
         if cur:
             words.append(cur)
 
-        progress(30 + int((ci + 1) / max(1, len(chunks)) * 55), "asr",
-                 "识别中 … 第 %d/%d 块" % (ci + 1, len(chunks)))
-
     words.sort(key=lambda w: w["start"])
     for i in range(1, len(words)):            # 时间戳偶发抖动, 不允许倒退
         if words[i]["start"] < words[i - 1]["start"]:
             words[i]["start"] = words[i - 1]["start"]
     return words
+
+
+def stability_of(rec, samples, sr, chunks, clean_per_chunk, tta_runs, log_fn=None):
+    """加噪重跑 -> 稳定性。逐块比对 token（块相同，位置可比）。
+
+    与 NPU 引擎同一套思路：如果加一点噪声转写就变了，说明模型在这段音频上本来就不稳。
+    比对按块进行 —— 不同块的 token 没有对应关系。
+    """
+    if tta_runs <= 0:
+        return {"stability": 1.0, "runs": 1, "affectedWords": 0, "wordCount": 0}
+    runs = []
+    for k in range(tta_runs):
+        if log_fn:
+            log_fn("稳定性重跑 %d/%d …" % (k + 1, tta_runs))
+        runs.append(_decode_chunks(rec, samples, sr, chunks,
+                                   noise=0.02 + 0.01 * k, seed=1000 + 977 * k, quiet=True))
+    # 把所有块的 token 首尾相接，变成整段序列 —— 上游 stability_from_runs 只吃一维序列，
+    # 而块之间本来就连续（split_chunks 切的是同一段音频），接起来不影响"位置可比"。
+    clean_ids = [tk["id"] for toks in clean_per_chunk for tk in toks]
+    noisy_ids = [[tk["id"] for toks in one for tk in toks] for one in runs]
+    return C.stability_score_runs(clean_ids, noisy_ids)
 
 
 def refine_word_ends(words, samples, sr):
@@ -378,7 +433,7 @@ def refine_word_ends(words, samples, sr):
     return words
 
 
-def words_to_segments(words):
+def words_to_segments(words, samples=None, sr=SAMPLE_RATE, stability=None):
     """基础断句: 句末标点 / 长停顿 / 行长兜底。纯本地规则, 不调用 LLM。"""
     groups, cur = [], []
     for w in words:
@@ -408,13 +463,29 @@ def words_to_segments(words):
 
     out = []
     for i, ws in enumerate(groups):
-        out.append({
+        seg = {
             "id": i,
             "start": ws[0]["start"],
             "end": ws[-1]["end"],
             "text": " ".join(w["word"] for w in ws).strip(),
             "words": [{"word": w["word"], "start": round(w["start"], 3), "end": round(w["end"], 3)} for w in ws],
-        })
+        }
+        if samples is not None:
+            # 句级置信度：本句音频质量打底，整体稳定性往下压。
+            # 本引擎**没有** token 概率项（sherpa 不给），所以 parts 里不放 token，
+            # 界面显示"—"而不是伪造一个分数。
+            a = max(0, int(seg["start"] * sr))
+            b = min(len(samples), int(seg["end"] * sr))
+            q = C.audio_quality(samples[a:b]) if b > a else {"score": 0.2}
+            score = q["score"] * (0.7 + 0.3 * float(stability.get("stability", 1.0)))
+            seg["confidence"] = {
+                "score": round(float(score), 3),
+                "low": bool(score < C.LOW_CONFIDENCE),
+                "worstWord": None,
+                "parts": {"audio": round(float(q["score"]), 3),
+                          "stability": round(float(stability.get("stability", 1.0)), 3)},
+            }
+        out.append(seg)
     for i in range(1, len(out)):              # 相邻行不交叠
         if out[i]["start"] < out[i - 1]["end"]:
             out[i]["start"] = out[i - 1]["end"]
@@ -434,6 +505,9 @@ def main():
                     help="热词文件: 每行一个词/短语(原始文本, 本脚本负责转 BPE 片段)")
     ap.add_argument("--hotwords-score", type=float, default=3.0,
                     help="热词强度(实测: 1.5 无效 / 3.0 生效且正确 / >=6 开始复读崩坏)")
+    ap.add_argument("--tta", type=int, default=2,
+                    help="稳定性重跑的遍数(默认 2): 给音频加微小噪声重跑, 看有多少 token 变了 "
+                         "—— 置信度的一个信号。设 0 关掉(更快, 但没有稳定性项)")
     args = ap.parse_args()
 
     hotwords = []
@@ -466,14 +540,31 @@ def main():
             raise RuntimeError("未识别到语音内容(模型输出为空)")
         log("识别完成 %d 词, 耗时 %.1fs" % (len(words), time.time() - t0))
 
+        # 置信度的稳定性项：加噪重跑。为省一次完整解码，这里重跑时只取 token 序列
+        # （_decode_chunks），词的重建只做一次。
+        stability = {"stability": 1.0, "runs": 1}
+        if args.tta > 0:
+            clean_per_chunk = _decode_chunks(rec, samples, sr, chunks, quiet=True)
+            stability = stability_of(rec, samples, sr, chunks, clean_per_chunk,
+                                     args.tta, log_fn=log)
+            log("稳定性 %.2f" % stability.get("stability", 1.0))
+
         progress(88, "asr", "整理词级时间轴 …")
         words = refine_word_ends(words, samples, sr)
-        segments = words_to_segments(words)
-        log("断句完成 %d 行" % len(segments))
+        segments = words_to_segments(words, samples, sr, stability)
+        low = sum(1 for s in segments if (s.get("confidence") or {}).get("low"))
+        log("断句完成 %d 行（其中 %d 行置信度偏低，建议复核）" % (len(segments), low))
+
+        # 整段汇总：只有音频质量与稳定性两个信号（本引擎没有 token 概率）
+        audio_all = C.audio_quality(samples)
+        overall = C.fuse_available(None, audio_all["score"], stability.get("stability", 1.0))
+        overall["audio"] = C.audio_summary(audio_all)
+        overall["note"] = "本引擎(sherpa-onnx)拿不到 token 概率，置信度由音频质量与稳定性合成"
 
         tmp = args.out + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"duration": round(dur, 3), "language": "en", "segments": segments},
+            json.dump({"duration": round(dur, 3), "language": "en", "segments": segments,
+                       "confidence": overall},
                       f, ensure_ascii=False)
         os.replace(tmp, args.out)
 

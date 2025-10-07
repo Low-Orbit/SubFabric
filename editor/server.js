@@ -23,7 +23,45 @@ const fonts = require('./fonts.js');          // 本机字体库: 让 ASS 样式
 const cast = require('./cast.js');            // LLM 分角色(纯逻辑: 阵容推断 + SPK→角色名)  // LLM 回复卫生+解析(剥思维链/平衡取JSON/密度校验)
 
 const ROOT = path.resolve(__dirname, '..'); // D:\subtitle
-const PORT = process.env.PORT ? Number(process.env.PORT) : 8321;
+
+/* ── 控制台输出同时落一份到文件 ────────────────────────────────────────
+ * 为什么需要: 无窗口启动器(启动SubFabric(无窗口).vbs)下 node **没有控制台**,
+ * 光靠控制台的日志就全丢了 —— 启动失败时用户什么都看不到。
+ * 这里有两条路可走: ①让启动器把 stdout 重定向到文件(要求经过 cmd, 实测在
+ * wscript 里调用会卡住, 见启动器注释); ②在 node 内部 tee 一份。选了 ② —— 不依赖
+ * 任何 shell 引号规则, 直接双击/发行版 exe 起也照样有日志。
+ * 写入失败(目录只读等)时静默降级, 绝不能因为日志把服务拖挂。 */
+const LOG_DIR = path.join(ROOT, 'logs');
+const CONSOLE_LOG = path.join(LOG_DIR, 'launcher-console.log');
+try {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  const stream = fs.createWriteStream(CONSOLE_LOG, { flags: 'a' });
+  stream.on('error', () => {});
+  const tee = (orig) => (...args) => {
+    orig.apply(console, args);
+    try {
+      const line = args.map(a => (typeof a === 'string' ? a : require('util').inspect(a))).join(' ');
+      stream.write('[' + new Date().toISOString().replace('T', ' ').slice(0, 19) + '] ' + line + '\n');
+    } catch {}
+  };
+  console.log = tee(console.log.bind(console));
+  console.error = tee(console.error.bind(console));
+  console.log('[subtitle-editor] 日志同时写入 ' + CONSOLE_LOG);
+} catch {}
+
+/** 端口: --port NNNN > 环境变量 PORT > 默认 8321。
+ *  为什么要 --port: 8321 上可能停着一个"看不见的旧实例"(它的托盘图标被收进了隐藏区),
+ *  这时用户需要一个不改环境变量就能换端口再起的入口 —— 启动器(启动SubFabric(无窗口).vbs)
+ *  就是用它传端口的。 */
+const PORT = (() => {
+  const i = process.argv.indexOf('--port');
+  if (i >= 0) {
+    const n = Number(process.argv[i + 1]);
+    if (Number.isInteger(n) && n > 0 && n < 65536) return n;
+    console.error('[subtitle-editor] --port 的值无效：' + process.argv[i + 1] + '（忽略，用默认端口）');
+  }
+  return process.env.PORT ? Number(process.env.PORT) : 8321;
+})();
 const HOST = '127.0.0.1';
 const APP_VERSION = '2.1.11'; // 与打版号一致; 改了就顺手同步这里
 
@@ -536,6 +574,21 @@ const ASR_MODELS = [
     draftAllowed: false,
   },
   {
+    // 与上面 sherpa-onnx 那条**同一份权重、同一套后处理**, 只换推理后端: 走 OpenVINO,
+    // 编码器吃 Intel NPU、预测/联合网络吃核显 —— 于是**没有 N 卡也能用 Parakeet**
+    // (sherpa-onnx 那条是 CUDA provider, 官方明确不支持 CPU, 核显/NPU 机器完全用不了)。
+    // 模型取自 istupakov/parakeet-tdt-0.6b-v2-onnx(即 NVIDIA parakeet-tdt-0.6b-v2 的参考 ONNX 导出)。
+    id: 'parakeet-tdt-0.6b-v2-npu',
+    name: 'Parakeet TDT 0.6B v2（英语·Intel NPU）',
+    engine: 'openvino',
+    repo: 'istupakov/parakeet-tdt-0.6b-v2-onnx',
+    files: ['encoder-model.onnx', 'encoder-model.onnx.data', 'decoder_joint-model.onnx', 'vocab.txt'],
+    sizeMB: 2390,
+    desc: 'OpenVINO 推理：编码器跑 Intel NPU、预测/联合网络跑核显，没有独显的机器也能用（无需 CUDA）。仅英语；需要 Intel NPU/AI Boost 驱动，NPU 不可用时自动退核显/CPU。首次识别要编译计算图（约 1~3 分钟），之后走缓存几秒',
+    dirName: 'parakeet-tdt-0.6b-v2-npu',
+    draftAllowed: true,
+  },
+  {
     // 云端识别: 没有本地模型文件、不需要显卡, 只要联网。音频会上传到第三方服务器 —— 由用户在模型下拉里
     // **显式选择**, 绝不作为"本地没装模型"时的兜底（见 resolveAsrModel）。
     // 两个云端引擎(必剪/剪映)互为备份: 免费云端普遍限次/限流, 一个不行就换另一个（见 transcribeCloud）。
@@ -602,6 +655,11 @@ const whisperVulkanOk = () => { try { return fs.statSync(path.join(WHISPER_RUNTI
 function asrGpuGateError(model) {
   // 云端识别在本机不做任何推理 —— 它不需要 GPU(与三个本地引擎的要求正好相反)
   if (model && model.cloud) return null;
+  // OpenVINO(NPU) 后端与 sherpa-onnx 正好相反: 它**不**要求 CUDA —— 编码器跑 Intel NPU、
+  // 预测/联合网络跑核显, 设备不可用时 asr_npu.py 自己逐级回退(GPU→CPU)并在日志里写明。
+  // 所以这里不能套用下面"必须是 CUDA 版 sherpa-onnx"的那条判断, 否则没有 N 卡的机器
+  // 会在创建初稿前就被挡下来。
+  if (model && model.engine === 'openvino') return null;
   if (model && model.engine === 'whisper.cpp') {
     if (!whisperRuntimeOk()) return 'whisper.cpp 运行时没装好，到「设置 → 识别模型」下载';
     if (!whisperVulkanOk()) return '未检测到 Vulkan 运行库（ggml-vulkan.dll）。语音识别不支持纯 CPU，要装/更新支持 Vulkan 的显卡驱动，或在设置里重新下载 whisper.cpp 运行时';
@@ -912,6 +970,18 @@ async function nvidiaGpu() {
  *  返回 'cpu' 表示 GPU 环境未就绪 —— ASR 会在创建初稿/选区重识别的 GPU 校验处直接报错, 不做 CPU 兜底 */
 const asrProvider = () => { const s = readAsrSettings(); return s.asrProvider === 'cuda' ? 'cuda' : 'cpu'; };
 
+/** 该引擎该用哪个 Python 脚本 + provider 参数。
+ *  sherpa-onnx → asr.py(CUDA provider; 官方不支持 CPU); openvino → asr_npu.py(NPU/核显/CPU)。 */
+const asrEngineArgs = (model) => {
+  const openvino = model && model.engine === 'openvino';
+  return {
+    script: openvino ? path.join(ASR_DIR, 'asr_npu.py') : ASR_SCRIPT,
+    provider: openvino ? 'npu' : 'cuda',
+    // 热词只对 sherpa-onnx 后端有效(asr_npu.py 会接受参数并在日志里说明忽略)
+    hotwords: openvino ? [] : parakeetHotwordArgs(),
+  };
+};
+
 /** 子进程退出码 → 人话。经典坑: Windows 上「python」不存在时, Microsoft Store 的
  *  占位别名 python.exe 会启动并退出 9009(它打印的提示是纯文本, 不是 asr.py 的 JSON 日志,
  *  旧版 sink 直接丢弃 → 用户只见「异常退出(代码 9009)」而日志面板空白, 无从排查)。 */
@@ -925,17 +995,31 @@ function asrExitHint(code) {
 /** 初稿预检: 解释器能启动 + sherpa-onnx/numpy 能导入。结果缓存 5 分钟。
  *  模型文件就绪 ≠ Python 环境就绪 —— 发行包不含 asr/.venv(体积原因),
  *  用户机器上有没有 Python、装没装依赖, 只有真跑一下才知道。 */
-let pyProbeCache = null;
+let pyProbeCache = null;         // { sherpa:{...}, openvino:{...} } —— 两个后端各探各的
 let pyProbeInflight = null;      // 与 probeNemo 同理: 状态页每秒轮询, 在途时复用同一个探测
-function probePython() {
-  if (pyProbeCache && Date.now() - pyProbeCache.at < 5 * 60 * 1000) return Promise.resolve(pyProbeCache);
-  if (pyProbeInflight) return pyProbeInflight;
+function probePython(engine) {
+  // 预检要 import 的包按引擎而定: sherpa-onnx 后端查 sherpa_onnx, OpenVINO(NPU) 后端查 openvino。
+  // 混用会让"装了 openvino 但没装 sherpa-onnx"的机器被误判成环境没装好(反之亦然)。
+  const wantOpenvino = engine === 'openvino';
+  const cacheKey = wantOpenvino ? 'openvino' : 'sherpa';
+  const cached = pyProbeCache && pyProbeCache[cacheKey];
+  if (cached && Date.now() - cached.at < 5 * 60 * 1000) return Promise.resolve(cached);
+  if (pyProbeInflight && pyProbeInflight[cacheKey]) return pyProbeInflight[cacheKey];
+  const probeCode = wantOpenvino
+    ? 'import sys; import openvino; import numpy; print(sys.version.split()[0] + " / openvino " + str(openvino.__version__))'
+    : 'import sys; import sherpa_onnx; import numpy; print(sys.version.split()[0] + " / sherpa-onnx " + str(getattr(sherpa_onnx, "__version__", "?")))';
   const p = new Promise((resolve) => {
     const p = spawn(ASR_PY,
-      ['-c', 'import sys; import sherpa_onnx; import numpy; print(sys.version.split()[0] + " / sherpa-onnx " + str(getattr(sherpa_onnx, "__version__", "?")))'],
+      ['-c', probeCode],
       { windowsHide: true, cwd: ASR_DIR, env: pySpawnEnv() });
     let out = '', err = '';
-    const done = (r) => { clearTimeout(timer); pyProbeCache = Object.assign({ at: Date.now() }, r); resolve(pyProbeCache); };
+    const done = (r) => {
+      clearTimeout(timer);
+      const rec = Object.assign({ at: Date.now() }, r);
+      pyProbeCache = Object.assign({}, pyProbeCache, { [cacheKey]: rec });
+      resolve(rec);
+    };
+    // OpenVINO 首次编译 NPU 计算图可能耗时几分钟, 但预检本身只 import 不编译 —— 10s 足够
     const timer = setTimeout(() => { try { p.kill(); } catch {} done({ ok: false, msg: 'Python 预检超时（10s）' }); }, 10000);
     p.stdout.on('data', c => { out += c; });
     p.stderr.on('data', c => { err += c; });
@@ -946,8 +1030,10 @@ function probePython() {
       done({ ok: false, msg: asrExitHint(code) + (detail ? ' —— ' + detail : '') });
     });
   });
-  pyProbeInflight = p.finally(() => { pyProbeInflight = null; });
-  return p;
+  pyProbeInflight = Object.assign(pyProbeInflight || {}, { [cacheKey]: p });
+  return p.finally(() => {
+    if (pyProbeInflight) delete pyProbeInflight[cacheKey];
+  });
 }
 
 function readAsrSettings() {
@@ -1471,7 +1557,7 @@ function startPyEnvSetup() {
       // 0) 现有解释器已经能用 → 跳过基础安装; 还没上 CUDA 时继续往下做 GPU 升级(有 N 卡才升)。
       //    基础环境与 GPU 解耦: 说话人分离(diarize.py)只依赖基础环境, 无 N 卡也能用。
       try {
-        const pre = await probePython();
+        const pre = await probePython('sherpa');
         if (pre.ok) {
           pyExe = ASR_PY;
           info = pre.msg;
@@ -2460,15 +2546,42 @@ function startPrepare(id, videoPath, mode) {
     return `&H00${b.toUpperCase()}${g.toUpperCase()}${r.toUpperCase()}`;
   }
 
+  /** ASR 置信度 → ASS 的 Script Info 注释（编辑器据此在列表里标"需复核"）。
+   *  与逐词高亮色同一套元数据约定（见 ass.js 的 getScriptInfoComment），
+   *  其它 ASS 播放器会忽略 `;` 开头的注释，所以对成品字幕没有任何影响。
+   *  格式: `行号:分数:最差词下标` 逗号分隔；没有置信度数据（其它识别引擎）就返回空串。 */
+  function confidenceMeta(segs) {
+    const parts = [];
+    for (let i = 0; i < segs.length; i++) {
+      const c = segs[i] && segs[i].confidence;
+      if (!c || typeof c.score !== 'number' || !Number.isFinite(c.score)) continue;
+      const w = Number.isInteger(c.worstWord) && c.worstWord >= 0 ? c.worstWord : '';
+      parts.push(i + ':' + Math.max(0, Math.min(1, c.score)).toFixed(2) + ':' + w);
+    }
+    return parts.length ? parts.join(',') : '';
+  }
+
+  /** 把置信度注释插进 ASS 头部（Script Info 段里）。没有数据就原样返回。 */
+  function withConfidence(assText, segs) {
+    const meta = confidenceMeta(segs);
+    if (!meta) return assText;
+    const line = '; SubFabricConfidence: ' + meta + '\n';
+    // 插在最后一个 Script Info 行之后（即第一个以 [ 开头的小节之前）
+    const idx = assText.search(/\n\[/);
+    if (idx < 0) return assText + line;
+    return assText.slice(0, idx + 1) + line + assText.slice(idx + 1);
+  }
+
   /** ASS 头: 与 main.py generate_ass_header 一致, 保留 Default / 中文字幕 两个样式轨。
    *  label = 识别引擎名(必剪云端 / Parakeet / whisper…), 导出文件里能看出这份初稿是谁识别的。
-   *  colors = { zhColor, zhColor2, enColor, enColor2 }, 缺省时英文白 / 中文黄(与颜色设置项出现前一致)。 */
+   *  colors = { zhColor, zhColor2, enColor, enColor2 }, 缺省时中英都是白 —— 深色画面下白字最好认,
+   *  也避免与 main.py 生成的对白颜色不一致(那边过去硬编码白、样式表却是黄)。 */
   function assHeader(label, colors) {
     const c = colors || {};
     const enPrimary = hexToAssBgr(c.enColor, '&H00FFFFFF');
     const enSecondary = hexToAssBgr(c.enColor2, '&H0000FFFF');
-    const zhPrimary = hexToAssBgr(c.zhColor, '&H0000FFFF');
-    const zhSecondary = hexToAssBgr(c.zhColor2, '&H0000FFFF');
+    const zhPrimary = hexToAssBgr(c.zhColor, '&H00FFFFFF');
+    const zhSecondary = hexToAssBgr(c.zhColor2, '&H00FFFFFF');
     return '[Script Info]\n'
       + '; Generated by K-ASS-Editor draft (' + (label || 'Parakeet TDT 0.6B v2') + ')\n'
       + 'ScriptType: v4.00+\nPlayDepth: 0\nScaledBorderAndShadow: Yes\n'
@@ -2564,7 +2677,7 @@ function startPrepare(id, videoPath, mode) {
       pushDraftLog(id, `[提示] 识别内容较短（共 ${totalWords} 词），降级为无逐词效果的整句字幕`);
       format = 'ass';
       file = 'subtitle.ass';
-      let out = assHeader(engineLabel);
+      let out = withConfidence(assHeader(engineLabel), segs);
       segs.forEach((s, i) => {
         const zh = zhText(i);
         if (zh) out += zhLine(s, zh, roleOf(s));
@@ -2574,7 +2687,7 @@ function startPrepare(id, videoPath, mode) {
     } else {
       format = 'ass';
       file = 'subtitle.ass';
-      let out = assHeader(engineLabel);
+      let out = withConfidence(assHeader(engineLabel), segs);
       segs.forEach((s, i) => {
         const zh = zhText(i);
         if (zh) out += zhLine(s, zh, roleOf(s));
@@ -2983,9 +3096,10 @@ function startPrepare(id, videoPath, mode) {
           } finally { try { fs.unlinkSync(mp3); } catch {} }
         } else {
           data = await new Promise((resolve, reject) => {
-            const py = spawn(ASR_PY, [ASR_SCRIPT, '--model', mdir, '--audio', segWav, '--out', outJson, '--threads', '4',
-              '--provider', 'cuda',
-              ...parakeetHotwordArgs()],
+            const ea = asrEngineArgs(model);
+            const py = spawn(ASR_PY, [ea.script, '--model', mdir, '--audio', segWav, '--out', outJson, '--threads', '4',
+              '--provider', ea.provider,
+              ...ea.hotwords],
               { windowsHide: true, cwd: ASR_DIR, env: pySpawnEnv() });
             let pyErr = '';
             const t = setTimeout(() => { try { py.kill(); } catch {} }, 25 * 60 * 1000);
@@ -3608,7 +3722,7 @@ function startPrepare(id, videoPath, mode) {
 
     // ── sherpa-onnx 引擎: asr.py ──
     // 预检通过才 spawn: 给远程用户可操作的修复指引, 而不是一句「异常退出(9009)」
-    probePython().then(pre => {
+    probePython(model.engine).then(pre => {
       const ts = () => new Date().toLocaleTimeString();
       if (!pre.ok) {
         pushDraftLog(id, `[${ts()}] [预检失败] ${pre.msg}`);
@@ -3626,9 +3740,10 @@ function startPrepare(id, videoPath, mode) {
         const runOneSlice = (slice, c) => new Promise((resolve, reject) => {
           const outP = path.join(projDir(id), 'asr.chunk' + c.index + '.json');
           let sliceErr = '', sbuf = '';
+          const ea = asrEngineArgs(model);
           const pr = spawn(ASR_PY,
-            [ASR_SCRIPT, '--model', mdir, '--audio', slice, '--out', outP, '--threads', '4',
-              '--provider', 'cuda', ...parakeetHotwordArgs()],
+            [ea.script, '--model', mdir, '--audio', slice, '--out', outP, '--threads', '4',
+              '--provider', ea.provider, ...ea.hotwords],
             { windowsHide: true, cwd: ASR_DIR, env: pySpawnEnv() });
           draftProcs.set(id, pr);
           const sink2 = (chunk) => {
@@ -3681,10 +3796,11 @@ function startPrepare(id, videoPath, mode) {
         return;
       }
       let lastErr = '', buf = '';
+      const ea = asrEngineArgs(model);
       const proc = spawn(ASR_PY,
-        [ASR_SCRIPT, '--model', mdir, '--audio', wav, '--out', outJson, '--threads', '4',
-          '--provider', 'cuda',
-          ...parakeetHotwordArgs()],
+        [ea.script, '--model', mdir, '--audio', wav, '--out', outJson, '--threads', '4',
+          '--provider', ea.provider,
+          ...ea.hotwords],
         { windowsHide: true, cwd: ASR_DIR, env: pySpawnEnv() });
       draftProcs.set(id, proc);
 
