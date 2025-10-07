@@ -27,8 +27,8 @@
   --accent-a55: rgba(255, 122, 69, .55);
   --accent-glow: 0 6px 20px var(--accent-a28);
   --danger: #ff5f6b;
-  --zh: #ff8a5c;          /* 中文行 */
-  --en: #e9e9f0;          /* 英文行 */
+  --zh: #ffffff;          /* 中文行：白 —— 深色背景下的默认观感, 与 ASS 样式默认色一致 */
+  --en: #e9e9f0;          /* 英文行：近白(比中文暗一档, 保留中英两轨的层次) */
   --lane-word: #8b7cf6;   /* 逐词轨道块 */
   --main-sub: #ffffff;
   --sub-sub: #ffd54a;
